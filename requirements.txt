@@ -1,0 +1,8 @@
+langgraph
+langchain-core
+langchain-ollama
+llama-index-core
+llama-index-readers-file
+llama-index-embeddings-huggingface
+python-dotenv
+pydantic
