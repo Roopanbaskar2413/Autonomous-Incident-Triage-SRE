@@ -43,7 +43,7 @@ class RCAOutput(BaseModel):
 
 
 def _get_llm() -> ChatOllama:
-    return ChatOllama(model="llama3.2", temperature=0)
+    return ChatOllama(model="incident-triage-llama", temperature=0)
 
 
 def triage_node(state: IncidentState) -> dict[str, Any]:
