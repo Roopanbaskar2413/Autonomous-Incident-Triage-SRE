@@ -4,12 +4,13 @@ show the operator the RCA and proposed remediation, then resume on approval.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Any
 
 from dotenv import load_dotenv
 
-from graph import build_graph, proposed_remediation_to_command
+from graph import build_graph, init_mcp_tools, proposed_remediation_to_command
 from state import IncidentState
 
 SAMPLE_ALERT: dict[str, Any] = {
@@ -29,8 +30,14 @@ def _print_header(title: str) -> None:
     print("=" * 72)
 
 
-def main() -> None:
+async def main() -> None:
     load_dotenv()
+
+    # The telemetry/runbook agents' tools are served over MCP by
+    # mcp_server.py (a stdio subprocess); loading them is async, so this
+    # must happen before build_graph() and the single asyncio.run() below
+    # is the only place this program enters an event loop.
+    await init_mcp_tools()
 
     app = build_graph()
     config = {"configurable": {"thread_id": "incident-001"}}
@@ -55,12 +62,12 @@ def main() -> None:
     print(f"Description: {SAMPLE_ALERT['description']}")
 
     try:
-        app.invoke(initial_state, config=config)
+        await app.ainvoke(initial_state, config=config)
     except Exception as exc:  # noqa: BLE001 - surface any pipeline failure clearly
         print(f"\nIncident triage pipeline failed before the approval gate: {exc}")
         sys.exit(1)
 
-    snapshot = app.get_state(config)
+    snapshot = await app.aget_state(config)
     state = snapshot.values
 
     _print_header("ROOT CAUSE ANALYSIS")
@@ -70,18 +77,20 @@ def main() -> None:
     print(proposed_remediation_to_command(state.get("proposed_remediation", {})))
 
     _print_header("HUMAN APPROVAL REQUIRED")
+    # Blocking input() inside this async function is fine here: this is a
+    # single-user CLI with nothing else needing the event loop concurrently.
     answer = input("Approve remediation? (yes/no): ").strip().lower()
     approved = answer in {"y", "yes"}
 
-    app.update_state(config, {"human_approved": approved})
+    await app.aupdate_state(config, {"human_approved": approved})
 
     try:
-        app.invoke(None, config=config)
+        await app.ainvoke(None, config=config)
     except Exception as exc:  # noqa: BLE001
         print(f"\nRemediation step failed: {exc}")
         sys.exit(1)
 
-    final_snapshot = app.get_state(config)
+    final_snapshot = await app.aget_state(config)
     final_messages = final_snapshot.values.get("messages", [])
 
     _print_header("OUTCOME")
@@ -92,4 +101,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

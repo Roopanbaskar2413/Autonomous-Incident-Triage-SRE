@@ -4,30 +4,90 @@ A supervisor agent routes between two specialist investigator agents
 (telemetry, runbooks) until enough evidence is gathered, then an RCA
 synthesizer agent produces the root cause analysis and a single proposed
 remediation, which a human must approve before execution.
+
+The telemetry/runbook agents' tools are served over MCP (Model Context
+Protocol) by mcp_server.py, a local stdio subprocess, rather than imported
+in-process. Loading those tools is inherently async (it spawns the server
+subprocess and speaks MCP over stdio), so `init_mcp_tools()` must be
+awaited once, from an async context, before `build_graph()` is called -
+see main.py's entrypoint.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import sys
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import BaseTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 
-from knowledge import query_runbooks_tool
 from state import IncidentState
-from tools import execute_remediation, fetch_service_logs, fetch_service_metrics
+from tools import execute_remediation
 
 MAX_SUPERVISOR_ITERATIONS = 4
 
+_MCP_SERVER_PATH = os.path.join(os.path.dirname(__file__), "mcp_server.py")
+_MCP_CONNECTIONS = {
+    "incident_tools": {
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": [_MCP_SERVER_PATH],
+    }
+}
+
+# Populated once by `init_mcp_tools()`; consumed by `_build_telemetry_agent()`
+# / `_build_runbook_agent()`. Module-level by design: the MCP tool list is
+# fetched once at startup, not refetched (and not re-spawning the server
+# subprocess) on every graph node call.
+_telemetry_tools: list[BaseTool] | None = None
+_runbook_tools: list[BaseTool] | None = None
+
+
+async def init_mcp_tools() -> None:
+    """Fetch the telemetry/runbook tools from the local MCP server.
+
+    Must be awaited exactly once, before `build_graph()`, from an async
+    context (see main.py). Spawns mcp_server.py as a stdio subprocess,
+    lists its tools, and splits them by name into the telemetry/runbook
+    tool sets used by the two specialist agents.
+    """
+    global _telemetry_tools, _runbook_tools
+
+    client = MultiServerMCPClient(_MCP_CONNECTIONS)
+    tools = await client.get_tools()
+    by_name = {tool.name: tool for tool in tools}
+
+    expected = {
+        "fetch_service_logs_mcp",
+        "fetch_service_metrics_mcp",
+        "query_runbooks_mcp",
+    }
+    missing = expected - by_name.keys()
+    if missing:
+        raise RuntimeError(
+            f"MCP server did not expose expected tools: missing {missing}. "
+            f"Tools it did expose: {sorted(by_name)}"
+        )
+
+    _telemetry_tools = [
+        by_name["fetch_service_logs_mcp"],
+        by_name["fetch_service_metrics_mcp"],
+    ]
+    _runbook_tools = [by_name["query_runbooks_mcp"]]
+
+
 TELEMETRY_AGENT_PROMPT = (
     "You are a telemetry investigation agent on an SRE incident response "
-    "team. Given a production incident, use the fetch_service_logs and "
-    "fetch_service_metrics tools to gather evidence for the affected "
+    "team. Given a production incident, use the fetch_service_logs_mcp and "
+    "fetch_service_metrics_mcp tools to gather evidence for the affected "
     "service. Call whichever tools you need, then respond with a concise, "
     "factual summary of what the logs and metrics show. Do not propose a "
     "remediation yourself; that is another agent's job."
@@ -36,7 +96,7 @@ TELEMETRY_AGENT_PROMPT = (
 RUNBOOK_AGENT_PROMPT = (
     "You are a runbook research agent on an SRE incident response team. "
     "Given a production incident and the telemetry evidence gathered so "
-    "far, use the query_runbooks_tool tool to search internal SRE runbooks "
+    "far, use the query_runbooks_mcp tool to search internal SRE runbooks "
     "for matching diagnosis and remediation guidance. Respond with a "
     "concise summary of the relevant guidance found."
 )
@@ -93,17 +153,27 @@ def _get_rca_llm() -> ChatOllama:
 
 
 def _build_telemetry_agent() -> Any:
+    if _telemetry_tools is None:
+        raise RuntimeError(
+            "MCP telemetry tools not loaded. `await init_mcp_tools()` must "
+            "run before build_graph() / the graph is invoked."
+        )
     return create_react_agent(
         _get_tool_llm(),
-        tools=[fetch_service_logs, fetch_service_metrics],
+        tools=_telemetry_tools,
         prompt=TELEMETRY_AGENT_PROMPT,
     )
 
 
 def _build_runbook_agent() -> Any:
+    if _runbook_tools is None:
+        raise RuntimeError(
+            "MCP runbook tools not loaded. `await init_mcp_tools()` must "
+            "run before build_graph() / the graph is invoked."
+        )
     return create_react_agent(
         _get_tool_llm(),
-        tools=[query_runbooks_tool],
+        tools=_runbook_tools,
         prompt=RUNBOOK_AGENT_PROMPT,
     )
 
@@ -166,8 +236,8 @@ def _route_from_supervisor(state: IncidentState) -> str:
     }.get(state.get("next_agent", "synthesize"), "rca_synthesizer")
 
 
-def telemetry_agent_node(state: IncidentState) -> dict[str, Any]:
-    """Specialist agent: investigates logs/metrics for the affected service."""
+async def telemetry_agent_node(state: IncidentState) -> dict[str, Any]:
+    """Specialist agent: investigates logs/metrics (over MCP) for the service."""
     alert = state["alert_payload"]
     service_name = state["service_name"]
     task = (
@@ -175,7 +245,7 @@ def telemetry_agent_node(state: IncidentState) -> dict[str, Any]:
         f"{alert.get('title', 'n/a')} - {alert.get('description', 'n/a')}"
     )
     agent = _build_telemetry_agent()
-    result = agent.invoke({"messages": [HumanMessage(content=task)]})
+    result = await agent.ainvoke({"messages": [HumanMessage(content=task)]})
     findings = result["messages"][-1].content
     return {
         "telemetry_findings": findings,
@@ -183,8 +253,8 @@ def telemetry_agent_node(state: IncidentState) -> dict[str, Any]:
     }
 
 
-def runbook_agent_node(state: IncidentState) -> dict[str, Any]:
-    """Specialist agent: searches internal runbooks for matching guidance."""
+async def runbook_agent_node(state: IncidentState) -> dict[str, Any]:
+    """Specialist agent: searches internal runbooks (over MCP) for guidance."""
     service_name = state["service_name"]
     task = (
         f"Service '{service_name}' incident. Telemetry findings so far:\n"
@@ -192,7 +262,7 @@ def runbook_agent_node(state: IncidentState) -> dict[str, Any]:
         "Find matching runbook guidance for diagnosis and remediation."
     )
     agent = _build_runbook_agent()
-    result = agent.invoke({"messages": [HumanMessage(content=task)]})
+    result = await agent.ainvoke({"messages": [HumanMessage(content=task)]})
     guidance = result["messages"][-1].content
     return {
         "runbook_guidance": guidance,

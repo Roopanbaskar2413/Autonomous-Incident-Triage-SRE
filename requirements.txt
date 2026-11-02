@@ -7,3 +7,5 @@ llama-index-embeddings-huggingface
 python-dotenv
 pydantic
 langsmith
+mcp
+langchain-mcp-adapters
