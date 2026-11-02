@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+finetune/
+k8s/
+README.md

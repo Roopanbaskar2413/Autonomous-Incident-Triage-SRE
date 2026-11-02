@@ -1,0 +1,62 @@
+# Deployment for the incident-triage agent.
+#
+# Design decisions (see README.md "Deployment" section for the full
+# reasoning):
+#
+# 1. Ollama (both the stock llama3.2 and the fine-tuned incident-triage-llama
+#    models) is NOT deployed in-cluster. It keeps running on the host, and
+#    this pod reaches it at http://host.minikube.internal:11434 - a DNS name
+#    minikube provides specifically for pods to reach the host machine. This
+#    avoids re-pulling/re-baking several GB of model weights that already
+#    exist on the host, and a single-node local cluster gives no real
+#    scaling/isolation benefit from containerizing the model server anyway.
+#
+# 2. No Service manifest. Nothing in this pod listens on a network port:
+#    main.py is a one-shot CLI tool that runs one triage pass and exits, not
+#    an HTTP server - there's no backend for a Service to route traffic to.
+#    A Service object here would be decorative. (If this were evolved into
+#    an HTTP-triggered endpoint, e.g. a FastAPI wrapper around the graph,
+#    the natural addition would be a ClusterIP Service on that port.)
+#
+# 3. The MCP server (mcp_server.py) is NOT a separate container. It's
+#    spawned by graph.py as a stdio subprocess of the same Python process,
+#    exactly as it runs on the host - that's just a child process on a
+#    shared filesystem, which works identically inside one container.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: incident-triage-agent
+  labels:
+    app: incident-triage-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: incident-triage-agent
+  template:
+    metadata:
+      labels:
+        app: incident-triage-agent
+    spec:
+      containers:
+        - name: incident-triage-agent
+          image: incident-triage-agent:latest
+          # Built locally and loaded directly into minikube's node via
+          # `minikube image load` - not pulled from a registry.
+          imagePullPolicy: Never
+          env:
+            - name: OLLAMA_BASE_URL
+              value: "http://host.minikube.internal:11434"
+          resources:
+            # 1Gi was tried first and the pod OOMKilled mid-run: each MCP
+            # tool call spawns its own mcp_server.py subprocess that
+            # independently loads torch/sentence-transformers/the embedding
+            # model (see knowledge.py), and the telemetry agent can call two
+            # tools concurrently - so two such subprocesses can be resident
+            # in this container's cgroup at once. 3Gi gives headroom for that.
+            requests:
+              cpu: "250m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "3Gi"

@@ -142,14 +142,24 @@ class SupervisorDecision(BaseModel):
     reasoning: str = Field(description="One sentence explaining the choice.")
 
 
+# Defaults to the host's local Ollama for the normal (non-containerized)
+# workflow. In the Kubernetes deployment this is overridden via the
+# OLLAMA_BASE_URL env var (see k8s/deployment.yaml) to reach Ollama running
+# on the host machine from inside the pod, e.g. http://host.minikube.internal:11434
+# - see README.md's Deployment section for why Ollama stays off-cluster.
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+
+
 def _get_tool_llm() -> ChatOllama:
     """Tool-calling capable model, used by the supervisor and specialist agents."""
-    return ChatOllama(model="llama3.2", temperature=0)
+    return ChatOllama(model="llama3.2", temperature=0, base_url=_OLLAMA_BASE_URL)
 
 
 def _get_rca_llm() -> ChatOllama:
     """Fine-tuned model used only for the final structured RCA synthesis."""
-    return ChatOllama(model="incident-triage-llama", temperature=0)
+    return ChatOllama(
+        model="incident-triage-llama", temperature=0, base_url=_OLLAMA_BASE_URL
+    )
 
 
 def _build_telemetry_agent() -> Any:
