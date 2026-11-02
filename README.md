@@ -14,6 +14,10 @@ Built with [LangGraph](https://github.com/langchain-ai/langgraph), as a supervis
 6. **Human Approval Gate** — the graph pauses and presents the RCA and proposed remediation to an operator for approval/rejection.
 7. **Remediation** — executes the approved action (simulated; no real cluster is touched) and reports the outcome.
 
+### Observability: LangSmith tracing
+
+When `LANGCHAIN_TRACING_V2=true` is set (see `.env.example`), LangGraph/LangChain automatically trace every run to [LangSmith](https://smith.langchain.com) — no code changes required. Each run shows the full multi-agent execution as a tree: the triage node, every supervisor routing decision, each specialist agent's tool calls, and the RCA synthesizer, with per-node latency and token cost broken out individually.
+
 ## Setup
 
 ```bash

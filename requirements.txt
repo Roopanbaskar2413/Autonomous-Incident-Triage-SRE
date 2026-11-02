@@ -6,3 +6,4 @@ llama-index-readers-file
 llama-index-embeddings-huggingface
 python-dotenv
 pydantic
+langsmith
