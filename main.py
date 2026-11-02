@@ -44,6 +44,8 @@ def main() -> None:
         "rca_summary": "",
         "proposed_remediation": {},
         "human_approved": None,
+        "next_agent": None,
+        "supervisor_iterations": 0,
     }
 
     _print_header("INCIDENT ALERT RECEIVED")

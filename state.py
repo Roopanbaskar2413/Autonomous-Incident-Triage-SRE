@@ -19,3 +19,5 @@ class IncidentState(TypedDict):
     rca_summary: str
     proposed_remediation: dict[str, Any]
     human_approved: Optional[bool]
+    next_agent: Optional[str]
+    supervisor_iterations: int
