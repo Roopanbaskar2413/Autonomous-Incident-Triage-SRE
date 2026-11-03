@@ -9,7 +9,7 @@ Built with [LangGraph](https://github.com/langchain-ai/langgraph), as a supervis
 1. **Triage** — parses the incoming alert payload and identifies the affected service.
 2. **Supervisor** — an LLM router that looks at what evidence has been gathered so far and decides which specialist investigates next (`telemetry`, `runbook`, or `synthesize` once there's enough to proceed). It re-runs after each specialist returns, so it can loop back for more evidence, skip a specialist, or stop early — capped at a few iterations as a safety net against indecisive routing.
 3. **Telemetry Agent** — a ReAct agent (via `langgraph.prebuilt.create_react_agent`) that decides for itself which of `fetch_service_logs_mcp` / `fetch_service_metrics_mcp` to call for the affected service, then summarizes what it found.
-4. **Runbook Agent** — a ReAct agent that searches internal SRE runbooks (local vector index — LlamaIndex + HuggingFace embeddings, no external API required) for guidance matching the incident.
+4. **Runbook Agent** — a ReAct agent that searches internal SRE runbooks (self-hosted Postgres + pgvector, LlamaIndex + HuggingFace embeddings — no external API or cloud account) for guidance matching the incident.
 5. **RCA Synthesizer** — once the supervisor has enough evidence, this node uses an LLM (local via [Ollama](https://ollama.com)) to produce a root cause analysis and propose exactly one remediation action. The model, `incident-triage-llama`, is a LoRA fine-tune of `Llama-3.2-3B-Instruct` trained to reliably emit the exact structured schema (e.g. short `remediation_action` slugs like `rolling_restart` instead of prose) — see [finetune/README.md](finetune/README.md) for how it was built and how to reproduce it. The two specialist agents and the supervisor run on the stock `llama3.2` model instead, since they need native tool-calling rather than the fine-tune's structured-output specialization.
 6. **Human Approval Gate** — the graph pauses and presents the RCA and proposed remediation to an operator for approval/rejection.
 7. **Remediation** — executes the approved action (simulated; no real cluster is touched) and reports the outcome.
@@ -26,6 +26,38 @@ Loading the MCP tool list is async, so `init_mcp_tools()` must be awaited once a
 
 One real tradeoff from this change: per `langchain-mcp-adapters`, a new MCP session (and, with the stdio transport, a new `mcp_server.py` subprocess) is spawned for every individual tool call, not reused across a run. In practice that means each telemetry/runbook tool call reloads the local embedding model used by `knowledge.py` on import — a few hundred milliseconds of extra startup per call, compared to the old in-process version. Functionally correct, just not free.
 
+### Runbook storage: Postgres + pgvector
+
+The runbook index is backed by a local, self-hosted Postgres + [pgvector](https://github.com/pgvector/pgvector) instance (`docker-compose.yml`) instead of LlamaIndex's default in-memory `VectorStoreIndex`. No cloud account, no external vector DB service — same embedding model (`BAAI/bge-small-en-v1.5`, local HuggingFace, verified 384-dim output), same `runbooks/` source documents, same `query_runbooks_tool` signature; this is a storage-layer swap only. `graph.py` and `mcp_server.py` are untouched.
+
+**Why this matters given the MCP tradeoff above:** every MCP tool call re-spawns `mcp_server.py` as a fresh subprocess, which previously meant rebuilding the in-memory vector index from `runbooks/` from scratch on *every single call*. With pgvector, ingestion happens once — `knowledge.py` checks on each process startup whether `data_runbooks` already has rows; if not, it ingests `runbooks/`, and if so, it just opens the existing index. This was chosen over a separate explicit ingestion script specifically because of that per-call-subprocess pattern: a manual step would be easy to forget, and "ingest if empty" is what makes ingestion happen exactly once ever instead of needing to be triggered out of band.
+
+Start it with:
+
+```bash
+docker compose up -d
+```
+
+This runs `pgvector/pgvector:pg16` — an image with the extension preinstalled, chosen over installing it manually into a stock `postgres` image — on `localhost:5432`, with credentials and connection settings in `docker-compose.yml` (overridable via `PGVECTOR_HOST` / `PGVECTOR_PORT` / `PGVECTOR_DATABASE` / `PGVECTOR_USER` / `PGVECTOR_PASSWORD` env vars). Data persists in a named Docker volume across restarts.
+
+Verified directly, not assumed: after a run, `psql`-ing into the container shows real ingested rows with real 384-dimension embedding vectors —
+
+```
+$ docker exec incident-triage-pgvector psql -U incident_triage -d incident_triage -c "SELECT COUNT(*) FROM data_runbooks;"
+ count
+-------
+     2
+(1 row)
+
+$ docker exec incident-triage-pgvector psql -U incident_triage -d incident_triage -c "SELECT vector_dims(embedding) FROM data_runbooks LIMIT 1;"
+ vector_dims
+-------------
+         384
+(1 row)
+```
+
+— and retrieval quality is unchanged: the same query run against the old in-memory index (from git history) and the new pgvector index returns byte-for-byte identical runbook text for the same `payment-service 504 timeouts connection pool exhaustion` query, since both use the same embedding model and documents, just a different nearest-neighbor backend.
+
 ## Setup
 
 ```bash
@@ -35,6 +67,12 @@ pip install -r requirements.txt
 ```
 
 Build (or rebuild) the fine-tuned `incident-triage-llama` Ollama model by following [finetune/README.md](finetune/README.md), and make sure the Ollama server is running.
+
+Start the local Postgres + pgvector instance the Runbook Agent needs (see the Runbook storage section above):
+
+```bash
+docker compose up -d
+```
 
 ## Run
 
@@ -130,6 +168,8 @@ OUTCOME
 
 The reject path (`echo no | kubectl exec -i "$POD" -- python main.py`) was also verified — correctly skips remediation, no restart.
 
+**Known stale point as of the pgvector swap:** this Deployment predates the Postgres + pgvector change above and has not been re-verified against it. The pod would need the same treatment as Ollama — `PGVECTOR_HOST` set to `host.minikube.internal` instead of the default `localhost` — since Postgres runs on the host via `docker compose`, not in-cluster. Not yet done; flagging rather than leaving it silently broken.
+
 ## Project layout
 
 - `main.py` — async entry point; loads MCP tools, runs the graph up to the approval gate, then resumes on operator input.
@@ -137,7 +177,8 @@ The reject path (`echo no | kubectl exec -i "$POD" -- python main.py`) was also 
 - `mcp_server.py` — local MCP server (stdio) exposing `tools.py` / `knowledge.py`'s tools; run as a subprocess by `graph.py`.
 - `state.py` — shared graph state schema.
 - `tools.py` — simulated telemetry fetch and remediation execution tools.
-- `knowledge.py` — local runbook knowledge base (LlamaIndex retrieval).
+- `knowledge.py` — runbook knowledge base (LlamaIndex retrieval, Postgres + pgvector-backed).
 - `runbooks/` — source runbook documents indexed for retrieval.
+- `docker-compose.yml` — local Postgres + pgvector for the runbook index (not deployed into Kubernetes; see Deployment section).
 - `Dockerfile`, `.dockerignore` — container image for the app (not Ollama; see Deployment section).
 - `k8s/deployment.yaml` — Kubernetes Deployment for the app pod.

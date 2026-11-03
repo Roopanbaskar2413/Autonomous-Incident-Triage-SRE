@@ -1,0 +1,24 @@
+# Local-only Postgres + pgvector for the Runbook Agent's vector index.
+# No cloud account, no external service - this runs entirely on the host.
+#
+#   docker compose up -d
+#
+# Data persists in the `pgvector_data` named volume across restarts; delete
+# it (`docker compose down -v`) to force re-ingestion of runbooks/ from
+# scratch.
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: incident-triage-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: incident_triage
+      POSTGRES_PASSWORD: incident_triage
+      POSTGRES_DB: incident_triage
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+
+volumes:
+  pgvector_data:

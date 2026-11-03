@@ -9,3 +9,5 @@ pydantic
 langsmith
 mcp
 langchain-mcp-adapters
+llama-index-vector-stores-postgres
+psycopg2-binary
